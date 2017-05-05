@@ -1,3 +1,20 @@
-# L1 Quantile Regression
+# Lasso Quantile Regression
 
-This code provides a Pyhton implementation of the  the L1 norm QR algorithm of Li and Zhu (2008). The paper is available at http://dx.doi.org/10.1198/106186008X289155.
+This code provides a Pyhton implementation of the  the lasso quantile regression algorithm of Li and Zhu (2008). 
+The paper is available at http://dx.doi.org/10.1198/106186008X289155.
+
+The major difference to alternatives such as hqreg (see below) is that this algorithm directly solves the constrained regression problem and not the Lagrangian formulation, which is convenient in forecast combination problems due to the similarity of the lasso and convex quantile regression.
+
+## Example
+
+In the repository, you can find the daily log return series of the IBM stock and the 1% VaR forecasts stemming from a variety of risk models.
+
+The following trace plot is the result of a forecast combination of the predicitons of the standalone models.
+
+![Alt text](/output/trace_plot.png)
+
+## Alternatives
+
+The [quantreg](https://cran.r-project.org/web/packages/quantreg/index.html) package for R can estimate the lasso quantile regression for single penalization levels.
+
+The [hqreg](https://cran.r-project.org/web/packages/hqreg/index.html) package for R implements the algorithm of [Yi and Huang](https://arxiv.org/abs/1509.02957) which estimates the whole path of elastic net penalized quantile regression.
