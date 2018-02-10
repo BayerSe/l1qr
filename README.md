@@ -10,7 +10,7 @@ This is for instance convenient in forecast combination problems due to the simi
 
 In the repository, you can find the daily log returns of the IBM stock and the corresponding 1% VaR forecasts stemming from a variety of risk models.
 
-The following trace plot is the result of a lasso quantile regression of the standalone forecasts on the returns.
+The trace plot below is the result of a lasso quantile regression of the returns on the standalone forecasts.
 
 ![Alt text](/output/trace_plot.png)
 
