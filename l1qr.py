@@ -1,34 +1,36 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
+import logging
 import time
+
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import matplotlib
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 
 class L1QR:
-    def __init__(self, y, x, alpha):
-        """
-        Python implementation of the L1 norm QR algorithm of
+    def __init__(self, y: pd.Series, x: pd.DataFrame, alpha: float) -> None:
+        """Python implementation of the L1 norm QR algorithm of
         Li and Zhu (2008): L1-Norm Quantile Regression, http://dx.doi.org/10.1198/106186008X289155
 
-        :param y Vector of response data
-        :param x Matrix of covariates. Can be either a numpy or pandas object
-        :param alpha Quantile of interest
+        Args:
+            y: Vector of response data
+            x: Matrix of covariates
+            alpha: Quantile of interest
         """
-
-        # If pandas object, extract the values
-        try:
-            self.x, self.y = x.values, y.values
-            self.var_names = x.columns
-        except:
-            self.x, self.y = x, y
-            self.var_names = range(x.shape[1])
+        self.x = x.to_numpy()
+        self.y = y.to_numpy()
+        self.var_names = x.columns
         self.alpha = alpha
 
+        # set by fit()
         self.beta0 = None
         self.beta = None
         self.s = None
@@ -36,17 +38,13 @@ class L1QR:
         self.b0 = None
         self.b = None
 
-    def fit(self, s_max=np.inf, steps=500, verbose=False):
-        """
-        The main function: estimate the model
+    def fit(self, s_max: float = np.inf) -> None:
+        """Estimate the model.
 
-        :param s_max Stop the algorithm prematurely when the L1 norm of the slope coefficients reaches s_max
-        :param steps: Number of interpolations steps of the parameter estimates
-        :param verbose If True, the function provides some information
+        Args:
+            s_max: Stop the algorithm prematurely when the L1 norm of the slope coefficients reaches s_max
         """
-
-        # region Initialization
-        start = time.clock()
+        start = time.process_time()
         y = self.y
         x = self.x
         alpha = self.alpha
@@ -55,23 +53,20 @@ class L1QR:
         n, k = x.shape  # Store number observations and number of coefficients
         if y.size != n:
             raise Exception('y and x have different number of rows!')
+        logger.info(f'Initialization lasso quantile regression for n={n}, k={k}, and alpha={alpha}')
+
         xc = np.hstack((np.ones((n, 1)), x))  # Store x a second time with intercept
-        eps1 = 10 ** -10  # Some low value (approximately zero)
+        eps1 = 10 ** -10  # Some low value
         eps2 = 10 ** -10  # Convergence criterion
         max_steps = n * np.min((k, n - 1))  # Maximum number of steps for the algorithm
 
-        def print_log(string):
-            if verbose:
-                print(string)
+        ind_n = np.arange(n)                   # Index of the observations
+        ind_k = np.arange(k)                   # Index of the variables
+        beta0 = np.zeros((max_steps + 1, 1))   # Stores the estimates of the constant term
+        beta = np.zeros((max_steps + 1, k))    # Stores the estimates of the slope parameters
+        s = np.zeros(max_steps + 1)            # Stores the penalty parameter
 
-        ind_n = np.arange(n)  # Index of the observations
-        ind_k = np.arange(k)  # Index of the variables
-        beta0 = np.zeros((max_steps + 1, 1))  # Stores the estimates of the constant term
-        beta = np.zeros((max_steps + 1, k))  # Stores the estimates of the slope parameters
-        s = np.zeros(max_steps + 1)  # Stores the penalty parameter
-        # endregion
-
-        # region Initial solution
+        # Initial solution
         # Check if the Ys can be ordered strictly. If not, add a little noise.
         while np.unique(y).size != n:
             y += np.random.normal(loc=0, scale=10 ** -5, size=y.size)
@@ -86,7 +81,7 @@ class L1QR:
 
         residual = y - ini_beta0  # Initial residuals
 
-        # region Add the first variable to the active set
+        # Add the first variable to the active set
         inactive = ind_k  # All variables not in V
         tmp_e, tmp_l, tmp_r = ind_e, ind_l, ind_r  # Create a copy of the index sets
         lambda_var = np.zeros((2, inactive.size))  # First row: sign=1, second row: sign=-1
@@ -128,13 +123,11 @@ class L1QR:
         # Store initial nu0 and nu
         nu0 = nu_var[ind_v, 0]
         nu = nu_var[ind_v, 1:]
-        # endregion
 
         beta0[0] = ini_beta0  # Store beta in array
         beta[0] = ini_beta
-        # endregion
 
-        # region Main loop
+        # Main loop
         drop = False
         idx = 0
         while idx < max_steps:
@@ -172,7 +165,7 @@ class L1QR:
 
             # Check if we need to continue or if we are done
             if delta == np.inf:
-                print_log('Finished!' + '(%.2fs)' % (time.clock() - start))
+                logger.info(f'Finished after {time.process_time() - start}s')
                 break
 
             # Update the shrinkage parameter
@@ -196,7 +189,7 @@ class L1QR:
             beta[idx, ind_v] = beta[idx - 1, ind_v] + delta * nu
 
             if s[idx] > s_max:
-                print_log('s high enough!' + '(%.2fs)' % (time.clock() - start))
+                logger.info(f's is high enough after {time.process_time() - start}s')
                 break
 
             # Reduce residuals not in the elbow by delta*gam
@@ -204,10 +197,10 @@ class L1QR:
 
             # Check if there are points in either L or R if we do not drop
             if (ind_l.size + ind_r.size == 1) & (not drop):
-                print_log('No point in L or R')
+                logger.info('No point in L or R')
                 break
 
-            # region Add a variable to the active set
+            # Add a variable to the active set
             # Test if all variables are included. If yes, set lambda_var to -inf and continue with next step
             if ind_v.size == k:
                 lambda_var = np.zeros((2, inactive.size))
@@ -241,7 +234,7 @@ class L1QR:
                                                x[tmp_e][:, ind_v].reshape((tmp_e.size, -1)),
                                                x[tmp_e, j_star].reshape((tmp_e.size, -1)))),
                                     np.hstack(
-                                        ((0, np.sign(beta[idx, ind_v]), np.nan)))))  # nan is a placeholder for sign
+                                        (0, np.sign(beta[idx, ind_v]), np.nan))))  # nan is a placeholder for sign
 
                     # Sign of the next variable to include may be either positive or negative
                     for sign in (1, -1):
@@ -265,9 +258,8 @@ class L1QR:
                 # Select the maximum of each column
                 nu_var = nu_var[lambda_var.argmax(axis=0), np.arange(inactive.size), :]
                 lambda_var = lambda_var.max(axis=0)
-            # endregion
 
-            # region  Remove an observation from the elbow
+            # Remove an observation from the elbow
             lambda_obs = np.zeros(tmp_e.size)
             lambda_obs[lambda_obs == 0] = -np.inf
             nu_obs = np.zeros((1 + ind_v.size, tmp_e.size))
@@ -281,7 +273,7 @@ class L1QR:
 
             # Combination of (2.10) and (2.11), here without an additional variable j
             x0_all = np.vstack((np.hstack((np.ones((tmp_e.size, 1)), x[tmp_e][:, ind_v].reshape((tmp_e.size, -1)))),
-                                np.hstack(((0, np.sign(beta[idx, ind_v]))))))
+                                np.hstack((0, np.sign(beta[idx, ind_v])))))
 
             for i in range(tmp_e.size):
                 x0 = np.delete(x0_all, i, 0)  # Delete the ith observation
@@ -300,9 +292,8 @@ class L1QR:
                         lambda_obs[i] += alpha * tmpyf
                 except:
                     pass
-            # endregion
 
-            # region Compare the effects of adding one variable to V and removing one observation from E
+            # Compare the effects of adding one variable to V and removing one observation from E
             lam_var = lambda_var.max()  # Maximum lambda from adding a variable
             lam_obs = lambda_obs.max()  # Maximum lambda from removing an observation from E
 
@@ -342,40 +333,38 @@ class L1QR:
                 # Remove i_star from E
                 ind_e = tmp_e[tmp_e != i_star]
             else:
-                print_log('No further descent, we are done ' + '(%.2fs).' % (time.clock() - start))
+                logger.info(f'No further descent, we are done after {time.process_time() - start}s')
                 break
 
             # Check if descent is too small
             if np.abs(lam) < eps2:
-                print_log('Descent is small enough, we are done ' + '(%.2fs).' % (time.clock() - start))
+                logger.info(f'Descent is small enough, we are done after {time.process_time() - start}s')
                 break
 
             drop = False
-            # endregion
-        # endregion
 
-        # region Save the results
+        # Save the results
         self.beta0 = beta0[:idx][:, 0]
         self.beta = beta[:idx]
         self.s = s[:idx]
-        self.time = time.clock() - start
+        self.time = time.process_time() - start
         self.var_names = var_names
 
         # Save the interpolated estimates
-        s = np.linspace(self.s[0], self.s[-1], steps)             # Interpolate shrinkage values
-        b0 = pd.Series(np.interp(s,self.s, self.beta0), index=s)  # Extract and interpolate intercept
+        s = np.linspace(self.s[0], self.s[-1], 1000)               # Interpolate shrinkage values
+        b0 = pd.Series(np.interp(s, self.s, self.beta0), index=s)  # Extract and interpolate intercept
         b = pd.DataFrame(np.apply_along_axis(lambda w: np.interp(s, self.s, w), 0, self.beta),
-                         index=s, columns=self.var_names)         # Extract and interpolate slope
+                         index=s, columns=self.var_names)          # Extract and interpolate slope
         self.b0 = b0
         self.b = b
-        # endregion
 
     def plot_trace(self, file_name=None, size=(8, 6)):
-        """
-        Plot the trace of the estimated coefficients
+        """Plot the trace of the estimated coefficients
 
-        :param file_name: If None, the figure will be displayed
-        :param size: (width, height) in inches
+        Args:
+            file_name: If None, the figure will be displayed
+            size: (width, height) in inches
+
         """
         plt.ioff()
 
@@ -424,5 +413,7 @@ if __name__ == "__main__":
 
     # Estimate the lasso quantile regression
     mdl = L1QR(y=Y, x=X, alpha=0.01)
-    mdl.fit(s_max=3)
-    mdl.plot_trace(file_name="output/trace_plot.png", size=(10, 6))
+    #mdl.fit(s_max=3)
+    mdl.fit()
+    #mdl.plot_trace(file_name="output/trace_plot.png", size=(10, 6))
+    #mdl.plot_trace(file_name="output/trace_plot.pdf", size=(6, 4))
