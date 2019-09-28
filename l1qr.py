@@ -1,101 +1,91 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+import logging
+from typing import Optional
 
-import time
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import matplotlib
+
+from numpy.linalg import LinAlgError
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 
 class L1QR:
-    def __init__(self, y, x, alpha):
-        """
-        Python implementation of the L1 norm QR algorithm of
+    def __init__(self, y: pd.Series, x: pd.DataFrame, alpha: float) -> None:
+        """Python implementation of the L1 norm QR algorithm of
         Li and Zhu (2008): L1-Norm Quantile Regression, http://dx.doi.org/10.1198/106186008X289155
 
-        :param y Vector of response data
-        :param x Matrix of covariates. Can be either a numpy or pandas object
-        :param alpha Quantile of interest
+        Args:
+            y: Vector of response data
+            x: Matrix of covariates
+            alpha: Quantile of interest
         """
-
-        # If pandas object, extract the values
-        try:
-            self.x, self.y = x.values, y.values
-            self.var_names = x.columns
-        except:
-            self.x, self.y = x, y
-            self.var_names = range(x.shape[1])
+        self.x = x.to_numpy()
+        self.y = y.to_numpy()
+        self.var_names = x.columns
         self.alpha = alpha
 
-        self.beta0 = None
-        self.beta = None
-        self.s = None
-        self.time = None
-        self.b0 = None
-        self.b = None
+        # set by fit()
+        self.beta0: Optional[np.array] = None
+        self.beta: Optional[np.array] = None
+        self.s: Optional[np.array] = None
+        self.b0: Optional[pd.Series] = None
+        self.b: Optional[pd.DataFrame] = None
 
-    def fit(self, s_max=np.inf, steps=500, verbose=False):
+    def fit(self, s_max: float = np.inf) -> None:
+        """Estimate the model.
+
+        Args:
+            s_max: Stop the algorithm prematurely when the L1 norm of the slope coefficients reaches s_max
         """
-        The main function: estimate the model
-
-        :param s_max Stop the algorithm prematurely when the L1 norm of the slope coefficients reaches s_max
-        :param steps: Number of interpolations steps of the parameter estimates
-        :param verbose If True, the function provides some information
-        """
-
-        # region Initialization
-        start = time.clock()
-        y = self.y
-        x = self.x
-        alpha = self.alpha
-        var_names = self.var_names
-
-        n, k = x.shape  # Store number observations and number of coefficients
-        if y.size != n:
+        n, k = self.x.shape
+        if self.y.size != n:
             raise Exception('y and x have different number of rows!')
-        xc = np.hstack((np.ones((n, 1)), x))  # Store x a second time with intercept
-        eps1 = 10 ** -10  # Some low value (approximately zero)
-        eps2 = 10 ** -10  # Convergence criterion
-        max_steps = n * np.min((k, n - 1))  # Maximum number of steps for the algorithm
+        logger.info(f'Initialization lasso quantile regression for n={n}, k={k}, and alpha={self.alpha}')
 
-        def print_log(string):
-            if verbose:
-                print(string)
+        xc = np.hstack((np.ones((n, 1)), self.x))  # Store x a second time with intercept
+        eps1 = 10 ** -10                           # Some low value
+        eps2 = 10 ** -10                           # Convergence criterion
+        max_steps = n * np.min((k, n - 1))         # Maximum number of steps for the algorithm
+        ind_n = np.arange(n)                       # Index of the observations
+        ind_k = np.arange(k)                       # Index of the variables
+        beta0 = np.zeros((max_steps + 1, 1))       # Stores the estimates of the constant term
+        beta = np.zeros((max_steps + 1, k))        # Stores the estimates of the slope parameters
+        s = np.zeros(max_steps + 1)                # Stores the penalty parameter
 
-        ind_n = np.arange(n)  # Index of the observations
-        ind_k = np.arange(k)  # Index of the variables
-        beta0 = np.zeros((max_steps + 1, 1))  # Stores the estimates of the constant term
-        beta = np.zeros((max_steps + 1, k))  # Stores the estimates of the slope parameters
-        s = np.zeros(max_steps + 1)  # Stores the penalty parameter
-        # endregion
+        y_can_be_ordered_strictly = np.unique(self.y).size != n
+        if y_can_be_ordered_strictly:
+            logger.info('Adding noise to y because y contains duplicate values')
+            self.y += np.random.normal(loc=0, scale=10 ** -5, size=self.y.size)
 
-        # region Initial solution
-        # Check if the Ys can be ordered strictly. If not, add a little noise.
-        while np.unique(y).size != n:
-            y += np.random.normal(loc=0, scale=10 ** -5, size=y.size)
+        logger.info('Finding initial solution')
 
         # There are actually two cases, first if n*tau is integer, second if tau*n is non-integer.
         # Here I assume that in the latter case all the weight is on the first component (see section 2.2)
-        ini_beta0 = np.sort(y)[int(np.floor(alpha * n))]  # Initial beta0 and beta (see 2.2.1)
-        ini_beta = np.zeros(k)  # Initial beta
-        ind_e = np.array(int(np.argwhere(y == ini_beta0)))  # Index of the first point in the elbow
-        ind_l = ind_n[y < y[ind_e]]  # All points that are left of the elbow
-        ind_r = ind_n[y > y[ind_e]]  # All points that are right of the elbow
+        ini_beta0 = np.sort(self.y)[int(np.floor(self.alpha * n))]  # Initial beta0 (see 2.2.1)
+        ini_beta = np.zeros(k)                                      # Initial beta (see 2.2.1)
 
-        residual = y - ini_beta0  # Initial residuals
+        ind_e = np.array(int(np.argwhere(self.y == ini_beta0)))  # Index of the first point in the elbow
+        ind_l = ind_n[self.y < self.y[ind_e]]                    # All points that are left of the elbow
+        ind_r = ind_n[self.y > self.y[ind_e]]                    # All points that are right of the elbow
+        residual = self.y - ini_beta0                            # Initial residuals
 
-        # region Add the first variable to the active set
-        inactive = ind_k  # All variables not in V
-        tmp_e, tmp_l, tmp_r = ind_e, ind_l, ind_r  # Create a copy of the index sets
-        lambda_var = np.zeros((2, inactive.size))  # First row: sign=1, second row: sign=-1
-        lambda_var[lambda_var == 0] = -np.inf  # Initially set to -inf (want to maximize lambda)
-        b = np.array([0, 1])  # The 1_0 vector (see p. 171 bottom)
-        nu_var = np.zeros((2, inactive.size, b.size))  # 3d array: nu for sign=1 in first dimension, sign=-1 in second
+        # Add the first variable to the active set
+        inactive = ind_k                                # All variables not in V
+        tmp_e, tmp_l, tmp_r = ind_e, ind_l, ind_r       # Create a copy of the index sets
+        lambda_var = np.zeros((2, inactive.size))       # First row: sign=1, second row: sign=-1
+        lambda_var[lambda_var == 0] = -np.inf           # Initially set to -inf (want to maximize lambda)
+        b = np.array([0, 1])                            # The 1_0 vector (see p. 171 bottom)
+        nu_var = np.zeros((2, inactive.size, b.size))   # 3d array: nu for sign=1 in first dimension, sign=-1 in second
 
-        for j in range(inactive.size):
-            j_star = inactive[j]  # Select variable j as candidate for the next active variable
+        for j_idx, j_star in enumerate(inactive):
             x_v = xc[:, np.append(0, j_star + 1)]
 
             # Sign of the next variable to include may be either positive or negative
@@ -103,20 +93,22 @@ class L1QR:
                 index = np.where(sign == 1, 0, 1)  # Index in nu_var and lambda_var
 
                 # Combination of (2.10) and (2.11)
-                x0 = np.vstack((np.hstack((1, np.mat(x)[tmp_e, j_star])), np.hstack((0, sign))))
+                x0 = np.vstack((np.hstack((1, np.mat(self.x)[tmp_e, j_star])), np.hstack((0, sign))))
 
                 try:  # Check if x0 has full rank
                     nu_tmp = np.linalg.solve(x0, b)  # Solve system (p. 171 bottom)
-                    nu_var[index, j, :] = nu_tmp
+                    nu_var[index, j_idx, :] = nu_tmp
+
                     # Store sets that are used to compute -lambda* (p. 172)
                     x_l = x_v.take(tmp_l, axis=0, mode='clip')
                     x_r = x_v.take(tmp_r, axis=0, mode='clip')
+
                     # Save lambda achieved by the current variable. If sign of last entry != sign then leave at -inf.
                     if np.sign(nu_tmp[-1]) == sign:
-                        lambda_var[index, j] = -(
-                        (1 - alpha) * np.dot(x_l, nu_tmp).sum() - alpha * np.dot(x_r, nu_tmp).sum())
-                except:
-                    pass
+                        lambda_var[index, j_idx] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
+                                                     self.alpha * np.dot(x_r, nu_tmp).sum())
+                except LinAlgError:
+                    logger.debug(f'sign: {sign}')
 
         # Select the nu corresponding to the maximum lambda and store the maximum lambda
         nu_var = nu_var[lambda_var.argmax(axis=0), np.arange(inactive.size), :]
@@ -128,24 +120,26 @@ class L1QR:
         # Store initial nu0 and nu
         nu0 = nu_var[ind_v, 0]
         nu = nu_var[ind_v, 1:]
-        # endregion
 
-        beta0[0] = ini_beta0  # Store beta in array
+        beta0[0] = ini_beta0
         beta[0] = ini_beta
-        # endregion
+        logger.debug(f'Initial beta0: {ini_beta0}')
+        logger.debug(f'Initial beta: {ini_beta}')
 
-        # region Main loop
+        # Main loop
+        logger.info('Entering main loop')
         drop = False
         idx = 0
         while idx < max_steps:
-            idx += 1  # Increase idx
+            logger.debug(f'Index: {idx}')
+            idx += 1
 
             # Calculate how far we need to move (the minimum distance between points and elbow)
             if np.atleast_1d(nu).size == 1:  # Make sure scalar array is converted to float, causes problems with np.dot
                 nu = np.float(nu)
 
             # (2.14), nu0 + x'*nu where x is without i in elbow
-            gam = nu0 + np.dot(x.take(ind_n[np.in1d(ind_n, ind_e, invert=True)], axis=0).take(ind_v, axis=1), nu)
+            gam = nu0 + np.dot(self.x.take(ind_n[np.in1d(ind_n, ind_e, invert=True)], axis=0).take(ind_v, axis=1), nu)
             gam = np.ravel(gam)  # Flatten the array
             delta1 = np.delete(residual, ind_e, 0) / gam  # This is s - s_l in (2.14)
 
@@ -172,7 +166,7 @@ class L1QR:
 
             # Check if we need to continue or if we are done
             if delta == np.inf:
-                print_log('Finished!' + '(%.2fs)' % (time.clock() - start))
+                logger.info(f'Finished, delta = inf')
                 break
 
             # Update the shrinkage parameter
@@ -196,7 +190,7 @@ class L1QR:
             beta[idx, ind_v] = beta[idx - 1, ind_v] + delta * nu
 
             if s[idx] > s_max:
-                print_log('s high enough!' + '(%.2fs)' % (time.clock() - start))
+                logger.info(f's = {s[idx]:.2f} is large enough')
                 break
 
             # Reduce residuals not in the elbow by delta*gam
@@ -204,10 +198,10 @@ class L1QR:
 
             # Check if there are points in either L or R if we do not drop
             if (ind_l.size + ind_r.size == 1) & (not drop):
-                print_log('No point in L or R')
+                logger.info('No point in L or R')
                 break
 
-            # region Add a variable to the active set
+            # Add a variable to the active set
             # Test if all variables are included. If yes, set lambda_var to -inf and continue with next step
             if ind_v.size == k:
                 lambda_var = np.zeros((2, inactive.size))
@@ -219,7 +213,8 @@ class L1QR:
                 if drop:
                     ind_v = ind_v[ind_v != j1]  # Remove the detected variable from V
                 else:
-                    # Add i_star to the Elbow and remove it from either Left or Right (we know that i_star hits the elbow)
+                    # Add i_star to the Elbow and remove it from either Left or Right
+                    # (we know that i_star hits the elbow)
                     tmp_e = np.append(tmp_e, i_star)
                     tmp_l = tmp_l[tmp_l != i_star]
                     tmp_r = tmp_r[tmp_r != i_star]
@@ -229,8 +224,8 @@ class L1QR:
                 nu_var = np.zeros((2, inactive.size, 1 + ind_v.size + 1))  # Store nus in 3d array
                 b = np.array([0] * (ind_v.size + 1) + [1])  # The 1_0 vector (see p. 171 bottom)
 
-                for j in range(inactive.size):
-                    j_star = inactive[j]  # Select variable j as candidate for the next active variable
+                for j_idx in range(inactive.size):
+                    j_star = inactive[j_idx]  # Select variable j as candidate for the next active variable
 
                     # Select all columns of x that are in ind_v and additionally j_star.
                     # Transposition improves performance as Python stores array in row-major order
@@ -238,10 +233,10 @@ class L1QR:
 
                     # Combination of (2.10) and (2.11)
                     x0 = np.vstack((np.hstack((np.ones((tmp_e.size, 1)),
-                                               x[tmp_e][:, ind_v].reshape((tmp_e.size, -1)),
-                                               x[tmp_e, j_star].reshape((tmp_e.size, -1)))),
+                                               self.x[tmp_e][:, ind_v].reshape((tmp_e.size, -1)),
+                                               self.x[tmp_e, j_star].reshape((tmp_e.size, -1)))),
                                     np.hstack(
-                                        ((0, np.sign(beta[idx, ind_v]), np.nan)))))  # nan is a placeholder for sign
+                                        (0, np.sign(beta[idx, ind_v]), np.nan))))  # nan is a placeholder for sign
 
                     # Sign of the next variable to include may be either positive or negative
                     for sign in (1, -1):
@@ -253,21 +248,20 @@ class L1QR:
 
                             # If sign of last entry != sign then leave at -inf.
                             if np.sign(nu_tmp[-1]) == sign:
-                                nu_var[index, j, :] = nu_tmp
+                                nu_var[index, j_idx, :] = nu_tmp
                                 # Store sets that are used to compute -lambda* (p. 172))
                                 x_l = x_v.take(tmp_l, axis=0, mode='clip')
                                 x_r = x_v.take(tmp_r, axis=0, mode='clip')
-                                lambda_var[index, j] = -(
-                                (1 - alpha) * np.dot(x_l, nu_tmp).sum() - alpha * np.dot(x_r, nu_tmp).sum())
-                        except:
+                                lambda_var[index, j_idx] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
+                                                             self.alpha * np.dot(x_r, nu_tmp).sum())
+                        except LinAlgError:
                             pass
 
                 # Select the maximum of each column
                 nu_var = nu_var[lambda_var.argmax(axis=0), np.arange(inactive.size), :]
                 lambda_var = lambda_var.max(axis=0)
-            # endregion
 
-            # region  Remove an observation from the elbow
+            # Remove an observation from the elbow
             lambda_obs = np.zeros(tmp_e.size)
             lambda_obs[lambda_obs == 0] = -np.inf
             nu_obs = np.zeros((1 + ind_v.size, tmp_e.size))
@@ -280,8 +274,8 @@ class L1QR:
             x_l = x_v.take(tmp_l, axis=0, mode='clip')
 
             # Combination of (2.10) and (2.11), here without an additional variable j
-            x0_all = np.vstack((np.hstack((np.ones((tmp_e.size, 1)), x[tmp_e][:, ind_v].reshape((tmp_e.size, -1)))),
-                                np.hstack(((0, np.sign(beta[idx, ind_v]))))))
+            x0_all = np.vstack((np.hstack((np.ones((tmp_e.size, 1)), self.x[tmp_e][:, ind_v].reshape((tmp_e.size, -1)))),
+                                np.hstack((0, np.sign(beta[idx, ind_v])))))
 
             for i in range(tmp_e.size):
                 x0 = np.delete(x0_all, i, 0)  # Delete the ith observation
@@ -289,20 +283,20 @@ class L1QR:
                     nu_tmp = np.linalg.solve(x0, b)  # Solve system (p. 171 bottom)
                     nu_obs[:, i] = nu_tmp
                     # Save lambda achieved by removing observation i
-                    lambda_obs[i] = -((1 - alpha) * np.dot(x_l, nu_tmp).sum() - alpha * np.dot(x_r, nu_tmp).sum())
+                    lambda_obs[i] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
+                                      self.alpha * np.dot(x_r, nu_tmp).sum())
 
                     # Test if we shift i to the left or to the right
-                    tmpyf = np.dot(np.append(1, x[tmp_e[i], ind_v]), nu_obs[:, i])
+                    tmpyf = np.dot(np.append(1, self.x[tmp_e[i], ind_v]), nu_obs[:, i])
                     if tmpyf > 0:  # To the left
                         left_obs[i] = 1
-                        lambda_obs[i] += -(1 - alpha) * tmpyf
+                        lambda_obs[i] += -(1 - self.alpha) * tmpyf
                     else:  # To the right
-                        lambda_obs[i] += alpha * tmpyf
-                except:
+                        lambda_obs[i] += self.alpha * tmpyf
+                except LinAlgError:
                     pass
-            # endregion
 
-            # region Compare the effects of adding one variable to V and removing one observation from E
+            # Compare the effects of adding one variable to V and removing one observation from E
             lam_var = lambda_var.max()  # Maximum lambda from adding a variable
             lam_obs = lambda_obs.max()  # Maximum lambda from removing an observation from E
 
@@ -342,40 +336,39 @@ class L1QR:
                 # Remove i_star from E
                 ind_e = tmp_e[tmp_e != i_star]
             else:
-                print_log('No further descent, we are done ' + '(%.2fs).' % (time.clock() - start))
+                logger.info('No further descent')
                 break
 
             # Check if descent is too small
             if np.abs(lam) < eps2:
-                print_log('Descent is small enough, we are done ' + '(%.2fs).' % (time.clock() - start))
+                logger.info('Descent is small enough')
                 break
 
             drop = False
-            # endregion
-        # endregion
 
-        # region Save the results
+        logger.info('Algorithm terminated')
+
+        # Save the results
         self.beta0 = beta0[:idx][:, 0]
         self.beta = beta[:idx]
         self.s = s[:idx]
-        self.time = time.clock() - start
-        self.var_names = var_names
+        self.var_names = self.var_names
 
         # Save the interpolated estimates
-        s = np.linspace(self.s[0], self.s[-1], steps)             # Interpolate shrinkage values
-        b0 = pd.Series(np.interp(s,self.s, self.beta0), index=s)  # Extract and interpolate intercept
+        s = np.linspace(self.s[0], self.s[-1], 1000)               # Interpolate shrinkage values
+        b0 = pd.Series(np.interp(s, self.s, self.beta0), index=s)  # Extract and interpolate intercept
         b = pd.DataFrame(np.apply_along_axis(lambda w: np.interp(s, self.s, w), 0, self.beta),
-                         index=s, columns=self.var_names)         # Extract and interpolate slope
+                         index=s, columns=self.var_names)          # Extract and interpolate slope
         self.b0 = b0
         self.b = b
-        # endregion
 
     def plot_trace(self, file_name=None, size=(8, 6)):
-        """
-        Plot the trace of the estimated coefficients
+        """Plot the trace of the estimated coefficients
 
-        :param file_name: If None, the figure will be displayed
-        :param size: (width, height) in inches
+        Args:
+            file_name: If None, the figure will be displayed
+            size: (width, height) in inches
+
         """
         plt.ioff()
 
@@ -419,7 +412,7 @@ class L1QR:
 if __name__ == "__main__":
 
     # Test data: the daily log returns of the IBM stock and the 1% VaR forecasts stemming from a variety of risk models.
-    Y = pd.read_csv("input/returns.txt", index_col=0).iloc[:, 0]
+    Y = pd.read_csv("input/returns.txt", index_col=0).squeeze()
     X = pd.read_csv("input/quantile_predicitons.txt", index_col=0)
 
     # Estimate the lasso quantile regression
