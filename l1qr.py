@@ -62,6 +62,13 @@ class L1QR:
         self.var_names = x.columns
         self.alpha = alpha
 
+        # set by fit()
+        self.beta0: Optional[np.array] = None
+        self.beta: Optional[np.array] = None
+        self.s: Optional[np.array] = None
+        self.b0: Optional[pd.Series] = None
+        self.b: Optional[pd.DataFrame] = None
+
     def fit(self, s_max: float = np.inf, eps1: float = 10 ** -10, eps2: float = 10 ** -10) -> None:
         """Estimate the model.
 
@@ -361,7 +368,7 @@ class L1QR:
 
     def _initialization_include_first_variable(self, coef, indx):
         for j_idx, j_star in enumerate(indx.inactive):
-            x_v = coef.xc[:, np.append(0, j_star + 1)]
+            x_v = coef.xc[:, [0, j_star + 1]]
 
             # Sign of the next variable to include may be either positive or negative
             for sign in (1, -1):
