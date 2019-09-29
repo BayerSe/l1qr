@@ -25,6 +25,7 @@ class IndexSets:
     left: np.array
     right: np.array
     inactive: np.array
+    active: np.array
     tmp_elbow: np.array
     tmp_left: np.array
     tmp_right: np.array
@@ -42,6 +43,8 @@ class Coefficients:
     lambda_var: np.array
     nu_var: np.array
     b: np.array
+    nu0: float
+    nu: np.array
 
 
 class L1QR:
@@ -79,21 +82,23 @@ class L1QR:
             raise Exception('y and x have different number of rows!')
         logger.info(f'Initialization lasso quantile regression for n={n}, k={k}, and alpha={self.alpha}')
 
-        max_steps = n * np.min((k, n - 1))         # Maximum number of steps for the algorithm
+        max_steps_algo = n * np.min((k, n - 1))
         self._check_if_y_can_be_ordered(n)
         _initial_beta0 = self._get_initial_beta0(n)
 
         coef = Coefficients(
-            xc=np.hstack((np.ones((n, 1)), self.x)),  # Store x a second time with intercept
+            xc=np.hstack((np.ones((n, 1)), self.x)),
             initial_beta0=_initial_beta0,
             initial_beta=np.zeros(k),
-            beta0=np.zeros((max_steps + 1, 1)),
-            beta=np.zeros((max_steps + 1, k)),
+            beta0=np.vstack((_initial_beta0, np.zeros((max_steps_algo, 1)))),
+            beta=np.zeros((max_steps_algo + 1, k)),
             residual=self.y - _initial_beta0,
-            s=np.zeros(max_steps + 1),
+            s=np.zeros(max_steps_algo + 1),
             lambda_var=np.full((2, k), -np.inf),   # First row: sign=1, second row: sign=-1
             b=np.array([0, 1]),                    # The 1_0 vector (see p. 171 bottom)
-            nu_var=np.zeros((2, k, 2))             # 3d array: nu for sign=1 in first dimension, sign=-1 in second
+            nu_var=np.zeros((2, k, 2)),            # 3d array: nu for sign=1 in first dimension, sign=-1 in second
+            nu0=0,
+            nu=np.array([])
         )
         indx = IndexSets(
             n=np.arange(n),
@@ -104,63 +109,27 @@ class L1QR:
             tmp_left=np.arange(n)[self.y < coef.initial_beta0],
             right=np.arange(n)[self.y > coef.initial_beta0],
             tmp_right=np.arange(n)[self.y > coef.initial_beta0],
-            inactive=np.arange(k)
+            inactive=np.arange(k),
+            active=np.array([])
         )
 
-        for j_idx, j_star in enumerate(indx.inactive):
-            x_v = coef.xc[:, np.append(0, j_star + 1)]
-
-            # Sign of the next variable to include may be either positive or negative
-            for sign in (1, -1):
-                index = np.where(sign == 1, 0, 1)  # Index in nu_var and lambda_var
-
-                # Combination of (2.10) and (2.11)
-                x0 = np.vstack((np.hstack((1, np.mat(self.x)[indx.tmp_elbow, j_star])), np.hstack((0, sign))))
-
-                try:  # Check if x0 has full rank
-                    nu_tmp = np.linalg.solve(x0, coef.b)  # Solve system (p. 171 bottom)
-                    coef.nu_var[index, j_idx, :] = nu_tmp
-
-                    # Store sets that are used to compute -lambda* (p. 172)
-                    x_l = x_v.take(indx.tmp_left, axis=0, mode='clip')
-                    x_r = x_v.take(indx.tmp_right, axis=0, mode='clip')
-
-                    # Save lambda achieved by the current variable. If sign of last entry != sign then leave at -inf.
-                    if np.sign(nu_tmp[-1]) == sign:
-                        coef.lambda_var[index, j_idx] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
-                                                          self.alpha * np.dot(x_r, nu_tmp).sum())
-                except LinAlgError:
-                    logger.debug(f'sign: {sign}')
-
-        # Select the nu corresponding to the maximum lambda and store the maximum lambda
-        coef.nu_var = coef.nu_var[coef.lambda_var.argmax(axis=0), np.arange(indx.inactive.size), :]
-        coef.lambda_var = coef.lambda_var.max(axis=0)
-
-        # Store the active variable
-        ind_v = indx.inactive[coef.lambda_var.argmax()]
-
-        # Store initial nu0 and nu
-        nu0 = coef.nu_var[ind_v, 0]
-        nu = coef.nu_var[ind_v, 1:]
-
-        coef.beta0[0] = coef.initial_beta0
-        coef.beta[0] = coef.initial_beta
+        indx, coef = self._assign_first_variable(coef, indx)
 
         # Main loop
         logger.info('Entering main loop')
         drop = False
         idx = 0
-        while idx < max_steps:
+        while idx < max_steps_algo:
             logger.debug(f'Index: {idx}')
             idx += 1
 
             # Calculate how far we need to move (the minimum distance between points and elbow)
-            if np.atleast_1d(nu).size == 1:  # Make sure scalar array is converted to float, causes problems with np.dot
-                nu = np.float(nu)
+            if np.atleast_1d(coef.nu).size == 1:  # Make sure scalar array is converted to float, causes problems with np.dot
+                coef.nu = np.float(coef.nu)
 
             # (2.14), nu0 + x'*nu where x is without i in elbow
-            gam = nu0 + np.dot(self.x.take(indx.n[np.in1d(indx.n, indx.elbow, invert=True)], axis=0) \
-                               .take(ind_v, axis=1), nu)
+            gam = coef.nu0 + np.dot(self.x.take(indx.n[np.in1d(indx.n, indx.elbow, invert=True)], axis=0) \
+                                    .take(indx.active, axis=1), coef.nu)
             gam = np.ravel(gam)  # Flatten the array
             delta1 = np.delete(coef.residual, indx.elbow, 0) / gam  # This is s - s_l in (2.14)
 
@@ -172,7 +141,7 @@ class L1QR:
 
             # Test if we need to remove some variable j from the active set
             if idx > 1:
-                delta2 = np.array(-coef.beta[idx - 1, ind_v] / nu)
+                delta2 = np.array(-coef.beta[idx - 1, indx.active] / coef.nu)
 
                 if np.sum(delta2 <= eps2) == delta2.size:
                     tmpz_remove = np.inf
@@ -197,7 +166,7 @@ class L1QR:
             # Prepare the next steps depending if we drop a variable or not
             if drop:
                 tmp_delta = delta2[delta2 > eps1]  # All deltas larger than eps2
-                tmp_ind = ind_v[delta2 > eps1]  # All V larger than eps2
+                tmp_ind = indx.active[delta2 > eps1]  # All V larger than eps2
                 j1 = tmp_ind[tmp_delta.argmin()]  # The index of the variable to kick out
             else:
                 # Find the i that will hit the elbow next
@@ -208,9 +177,12 @@ class L1QR:
                 logger.debug(f'i_star = {i_star}')
 
             # Update beta
-            coef.beta0[idx] = coef.beta0[idx - 1] + delta * nu0
+            coef.beta0[idx] = coef.beta0[idx - 1] + delta * coef.nu0
             coef.beta[idx] = coef.beta[idx - 1]
-            coef.beta[idx, ind_v] = coef.beta[idx - 1, ind_v] + delta * nu
+            coef.beta[idx, indx.active] = coef.beta[idx - 1, indx.active] + delta * coef.nu
+
+            logger.debug(f'Update intercept from {coef.beta0[idx - 1, 0]:.2f} to {coef.beta0[idx, 0]:.2f}')
+            logger.debug(f'Update slope from\n{coef.beta[idx - 1, indx.active]} to\n{coef.beta[idx, indx.active]}')
 
             if coef.s[idx] > s_max:
                 logger.info(f's = {coef.s[idx]:.2f} >= {s_max:.2f} is large enough')
@@ -226,16 +198,16 @@ class L1QR:
 
             # Add a variable to the active set
             # Test if all variables are included. If yes, set lambda_var to -inf and continue with next step
-            if ind_v.size == k:
+            if indx.active.size == k:
                 coef.lambda_var = np.full((2, k), -np.inf)
             else:
-                indx.inactive = indx.k[np.in1d(indx.k, ind_v, invert=True)]  # All variables not in V
+                indx.inactive = indx.k[np.in1d(indx.k, indx.active, invert=True)]  # All variables not in V
                 indx.tmp_elbow = indx.elbow
                 indx.tmp_left = indx.left
                 indx.tmp_right = indx.right
 
                 if drop:
-                    ind_v = ind_v[ind_v != j1]  # Remove the detected variable from V
+                    indx.active = indx.active[indx.active != j1]  # Remove the detected variable from V
                 else:
                     # Add i_star to the Elbow and remove it from either Left or Right
                     # (we know that i_star hits the elbow)
@@ -246,22 +218,22 @@ class L1QR:
 
                 coef.lambda_var = np.zeros((2, indx.inactive.size))  # First row: sign=1, second row: sign=-1
                 coef.lambda_var[coef.lambda_var == 0] = -np.inf  # Initially set to -inf (want to maximize lambda)
-                coef.nu_var = np.zeros((2, indx.inactive.size, 1 + ind_v.size + 1))  # Store nus in 3d array
-                coef.b = np.array([0] * (ind_v.size + 1) + [1])  # The 1_0 vector (see p. 171 bottom)
+                coef.nu_var = np.zeros((2, indx.inactive.size, 1 + indx.active.size + 1))  # Store nus in 3d array
+                coef.b = np.array([0] * (indx.active.size + 1) + [1])  # The 1_0 vector (see p. 171 bottom)
 
                 for j_idx in range(indx.inactive.size):
                     j_star = indx.inactive[j_idx]  # Select variable j as candidate for the next active variable
 
-                    # Select all columns of x that are in ind_v and additionally j_star.
+                    # Select all columns of x that are in indx.active and additionally j_star.
                     # Transposition improves performance as Python stores array in row-major order
-                    x_v = coef.xc.T.take(np.append(0, np.append(ind_v, j_star) + 1), axis=0, mode='clip').T
+                    x_v = coef.xc.T.take(np.append(0, np.append(indx.active, j_star) + 1), axis=0, mode='clip').T
 
                     # Combination of (2.10) and (2.11)
                     x0 = np.vstack((np.hstack((np.ones((indx.tmp_elbow.size, 1)),
-                                               self.x[indx.tmp_elbow][:, ind_v].reshape((indx.tmp_elbow.size, -1)),
+                                               self.x[indx.tmp_elbow][:, indx.active].reshape((indx.tmp_elbow.size, -1)),
                                                self.x[indx.tmp_elbow, j_star].reshape((indx.tmp_elbow.size, -1)))),
                                     np.hstack(
-                                        (0, np.sign(coef.beta[idx, ind_v]), np.nan))))  # nan is a placeholder for sign
+                                        (0, np.sign(coef.beta[idx, indx.active]), np.nan))))  # nan is a placeholder for sign
 
                     # Sign of the next variable to include may be either positive or negative
                     for sign in (1, -1):
@@ -278,7 +250,7 @@ class L1QR:
                                 x_l = x_v.take(indx.tmp_left, axis=0, mode='clip')
                                 x_r = x_v.take(indx.tmp_right, axis=0, mode='clip')
                                 coef.lambda_var[index, j_idx] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
-                                                             self.alpha * np.dot(x_r, nu_tmp).sum())
+                                                                  self.alpha * np.dot(x_r, nu_tmp).sum())
                         except LinAlgError:
                             pass
 
@@ -289,31 +261,31 @@ class L1QR:
             # Remove an observation from the elbow
             lambda_obs = np.zeros(indx.tmp_elbow.size)
             lambda_obs[lambda_obs == 0] = -np.inf
-            nu_obs = np.zeros((1 + ind_v.size, indx.tmp_elbow.size))
+            nu_obs = np.zeros((1 + indx.active.size, indx.tmp_elbow.size))
             left_obs = np.zeros(indx.tmp_elbow.size)  # 1 if if we shifted observation to the left
-            b = np.array([0] * ind_v.size + [1])
+            coef.b = np.array([0] * indx.active.size + [1])
 
             # Store the L and the R observations of x
-            x_v = coef.xc.T.take(np.append(0, ind_v + 1), axis=0, mode='clip').T
+            x_v = coef.xc.T.take(np.append(0, indx.active + 1), axis=0, mode='clip').T
             x_r = x_v.take(indx.tmp_right, axis=0, mode='clip')
             x_l = x_v.take(indx.tmp_left, axis=0, mode='clip')
 
             # Combination of (2.10) and (2.11), here without an additional variable j
             x0_all = np.vstack((np.hstack((np.ones((indx.tmp_elbow.size, 1)),
-                                           self.x[indx.tmp_elbow][:, ind_v].reshape((indx.tmp_elbow.size, -1)))),
-                                np.hstack((0, np.sign(coef.beta[idx, ind_v])))))
+                                           self.x[indx.tmp_elbow][:, indx.active].reshape((indx.tmp_elbow.size, -1)))),
+                                np.hstack((0, np.sign(coef.beta[idx, indx.active])))))
 
             for i in range(indx.tmp_elbow.size):
                 x0 = np.delete(x0_all, i, 0)  # Delete the ith observation
                 try:
-                    nu_tmp = np.linalg.solve(x0, b)  # Solve system (p. 171 bottom)
+                    nu_tmp = np.linalg.solve(x0, coef.b)  # Solve system (p. 171 bottom)
                     nu_obs[:, i] = nu_tmp
                     # Save lambda achieved by removing observation i
                     lambda_obs[i] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
                                       self.alpha * np.dot(x_r, nu_tmp).sum())
 
                     # Test if we shift i to the left or to the right
-                    tmpyf = np.dot(np.append(1, self.x[indx.tmp_elbow[i], ind_v]), nu_obs[:, i])
+                    tmpyf = np.dot(np.append(1, self.x[indx.tmp_elbow[i], indx.active]), nu_obs[:, i])
                     if tmpyf > 0:  # To the left
                         left_obs[i] = 1
                         lambda_obs[i] += -(1 - self.alpha) * tmpyf
@@ -329,7 +301,7 @@ class L1QR:
             if (lam_var > lam_obs) & (lam_var > 0):  # Add variable to V
                 lam = lam_var
 
-                ind_v = np.append(ind_v, indx.inactive[coef.lambda_var.argmax()])
+                indx.active = np.append(indx.active, indx.inactive[coef.lambda_var.argmax()])
 
                 if not drop:  # Add i_star to the elbow
                     logger.debug(f'Move {i_star} from Left/Right to Elbow')
@@ -338,8 +310,8 @@ class L1QR:
                     indx.right = indx.right[indx.right != i_star]
 
                 # Store nu0 and nu
-                nu0 = coef.nu_var[coef.lambda_var.argmax(), 0]
-                nu = coef.nu_var[coef.lambda_var.argmax(), 1:]
+                coef.nu0 = coef.nu_var[coef.lambda_var.argmax(), 0]
+                coef.nu = coef.nu_var[coef.lambda_var.argmax(), 1:]
 
             elif (lam_obs > lam_var) & (lam_obs > 0):  # Remove observation from E
                 lam = lam_obs
@@ -353,8 +325,8 @@ class L1QR:
                 # Find a new i_star
                 i_star = indx.tmp_elbow[lambda_obs.argmax()]
                 logger.debug(f'New i_star = {i_star}')
-                nu0 = nu_obs[0, lambda_obs.argmax()]
-                nu = nu_obs[1:, lambda_obs.argmax()]
+                coef.nu0 = nu_obs[0, lambda_obs.argmax()]
+                coef.nu = nu_obs[1:, lambda_obs.argmax()]
 
                 # Test if we need to add i_star to L or R
                 if left_obs[lambda_obs.argmax()] == 1:
@@ -393,6 +365,42 @@ class L1QR:
                          index=s, columns=self.var_names)          # Extract and interpolate slope
         self.b0 = b0
         self.b = b
+
+    def _assign_first_variable(self, coef, indx):
+        for j_idx, j_star in enumerate(indx.inactive):
+            x_v = coef.xc[:, np.append(0, j_star + 1)]
+
+            # Sign of the next variable to include may be either positive or negative
+            for sign in (1, -1):
+                index = np.where(sign == 1, 0, 1)  # Index in nu_var and lambda_var
+
+                # Combination of (2.10) and (2.11)
+                x0 = np.vstack((np.hstack((1, np.mat(self.x)[indx.tmp_elbow, j_star])), np.hstack((0, sign))))
+
+                try:  # Check if x0 has full rank
+                    nu_tmp = np.linalg.solve(x0, coef.b)  # Solve system (p. 171 bottom)
+                    coef.nu_var[index, j_idx, :] = nu_tmp
+
+                    # Store sets that are used to compute -lambda* (p. 172)
+                    x_l = x_v.take(indx.tmp_left, axis=0, mode='clip')
+                    x_r = x_v.take(indx.tmp_right, axis=0, mode='clip')
+
+                    # Save lambda achieved by the current variable. If sign of last entry != sign then leave at -inf.
+                    if np.sign(nu_tmp[-1]) == sign:
+                        coef.lambda_var[index, j_idx] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
+                                                          self.alpha * np.dot(x_r, nu_tmp).sum())
+                except LinAlgError:
+                    logger.debug(f'sign: {sign}')
+        # Select the nu corresponding to the maximum lambda and store the maximum lambda
+        coef.nu_var = coef.nu_var[coef.lambda_var.argmax(axis=0), np.arange(indx.inactive.size), :]
+        coef.lambda_var = coef.lambda_var.max(axis=0)
+        # Store the active variable
+        indx.active = indx.inactive[coef.lambda_var.argmax()]
+        # Store initial nu0 and nu
+        coef.nu0 = coef.nu_var[indx.active, 0]
+        coef.nu = coef.nu_var[indx.active, 1:]
+
+        return indx, coef
 
     def _get_initial_beta0(self, n):
         """
