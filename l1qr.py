@@ -62,13 +62,6 @@ class L1QR:
         self.var_names = x.columns
         self.alpha = alpha
 
-        # set by fit()
-        self.beta0: Optional[np.array] = None
-        self.beta: Optional[np.array] = None
-        self.s: Optional[np.array] = None
-        self.b0: Optional[pd.Series] = None
-        self.b: Optional[pd.DataFrame] = None
-
     def fit(self, s_max: float = np.inf, eps1: float = 10 ** -10, eps2: float = 10 ** -10) -> None:
         """Estimate the model.
 
@@ -82,18 +75,18 @@ class L1QR:
             raise Exception('y and x have different number of rows!')
         logger.info(f'Initialization lasso quantile regression for n={n}, k={k}, and alpha={self.alpha}')
 
-        max_steps_algo = n * np.min((k, n - 1))
+        max_steps_algorithm = n * np.min((k, n - 1))
         self._check_if_y_can_be_ordered(n)
-        _initial_beta0 = self._get_initial_beta0(n)
+        initial_beta0 = self._get_initial_beta0(n)
 
         coef = Coefficients(
             xc=np.hstack((np.ones((n, 1)), self.x)),
-            initial_beta0=_initial_beta0,
+            initial_beta0=initial_beta0,
             initial_beta=np.zeros(k),
-            beta0=np.vstack((_initial_beta0, np.zeros((max_steps_algo, 1)))),
-            beta=np.zeros((max_steps_algo + 1, k)),
-            residual=self.y - _initial_beta0,
-            s=np.zeros(max_steps_algo + 1),
+            beta0=np.vstack((initial_beta0, np.zeros((max_steps_algorithm, 1)))),
+            beta=np.zeros((max_steps_algorithm + 1, k)),
+            residual=self.y - initial_beta0,
+            s=np.zeros(max_steps_algorithm + 1),
             lambda_var=np.full((2, k), -np.inf),   # First row: sign=1, second row: sign=-1
             b=np.array([0, 1]),                    # The 1_0 vector (see p. 171 bottom)
             nu_var=np.zeros((2, k, 2)),            # 3d array: nu for sign=1 in first dimension, sign=-1 in second
@@ -113,13 +106,13 @@ class L1QR:
             active=np.array([])
         )
 
-        indx, coef = self._assign_first_variable(coef, indx)
+        indx, coef = self._initialization_include_first_variable(coef, indx)
 
         # Main loop
         logger.info('Entering main loop')
-        drop = False
+        drop_variable = False
         idx = 0
-        while idx < max_steps_algo:
+        while idx < max_steps_algorithm:
             logger.debug(f'Index: {idx}')
             idx += 1
 
@@ -149,10 +142,10 @@ class L1QR:
                     tmpz_remove = delta2[delta2 > eps1].min()
 
                 if tmpz_remove < delta:
-                    drop = True
+                    drop_variable = True
                     delta = tmpz_remove
                 else:
-                    drop = False
+                    drop_variable = False
 
             # Check if we need to continue or if we are done
             if delta == np.inf:
@@ -164,10 +157,11 @@ class L1QR:
             coef.s[idx] = coef.s[idx - 1] + delta
 
             # Prepare the next steps depending if we drop a variable or not
-            if drop:
+            if drop_variable:
                 tmp_delta = delta2[delta2 > eps1]  # All deltas larger than eps2
                 tmp_ind = indx.active[delta2 > eps1]  # All V larger than eps2
                 j1 = tmp_ind[tmp_delta.argmin()]  # The index of the variable to kick out
+                logger.debug(f'Removing {j1} from the active variables')
             else:
                 # Find the i that will hit the elbow next
                 tmp_ind = np.delete(indx.n, indx.elbow)[
@@ -192,7 +186,7 @@ class L1QR:
             coef.residual[np.in1d(indx.n, indx.elbow, invert=True)] -= delta * gam
 
             # Check if there are points in either L or R if we do not drop
-            if (indx.left.size + indx.right.size == 1) & (not drop):
+            if (indx.left.size + indx.right.size == 1) & (not drop_variable):
                 logger.info('No point in Left or Right')
                 break
 
@@ -206,12 +200,11 @@ class L1QR:
                 indx.tmp_left = indx.left
                 indx.tmp_right = indx.right
 
-                if drop:
+                if drop_variable:
                     indx.active = indx.active[indx.active != j1]  # Remove the detected variable from V
                 else:
                     # Add i_star to the Elbow and remove it from either Left or Right
                     # (we know that i_star hits the elbow)
-                    logger.debug(f'Move {i_star} from Left/Right to Elbow')
                     indx.tmp_elbow = np.append(indx.tmp_elbow, i_star)
                     indx.tmp_left = indx.tmp_left[indx.tmp_left != i_star]
                     indx.tmp_right = indx.tmp_right[indx.tmp_right != i_star]
@@ -303,7 +296,7 @@ class L1QR:
 
                 indx.active = np.append(indx.active, indx.inactive[coef.lambda_var.argmax()])
 
-                if not drop:  # Add i_star to the elbow
+                if not drop_variable:  # Add i_star to the elbow
                     logger.debug(f'Move {i_star} from Left/Right to Elbow')
                     indx.elbow = np.append(indx.elbow, i_star)
                     indx.left = indx.left[indx.left != i_star]
@@ -317,7 +310,7 @@ class L1QR:
                 lam = lam_obs
 
                 # i_star remains in E, no change in V
-                if not drop:
+                if not drop_variable:
                     logger.debug(f'Remove {i_star} from Left/Right')
                     indx.left = indx.left[indx.left != i_star]
                     indx.right = indx.right[indx.right != i_star]
@@ -348,7 +341,7 @@ class L1QR:
                 logger.info('Descent is small enough')
                 break
 
-            drop = False
+            drop_variable = False
 
         logger.info('Algorithm terminated')
 
@@ -366,7 +359,7 @@ class L1QR:
         self.b0 = b0
         self.b = b
 
-    def _assign_first_variable(self, coef, indx):
+    def _initialization_include_first_variable(self, coef, indx):
         for j_idx, j_star in enumerate(indx.inactive):
             x_v = coef.xc[:, np.append(0, j_star + 1)]
 
@@ -390,12 +383,16 @@ class L1QR:
                         coef.lambda_var[index, j_idx] = -((1 - self.alpha) * np.dot(x_l, nu_tmp).sum() -
                                                           self.alpha * np.dot(x_r, nu_tmp).sum())
                 except LinAlgError:
-                    logger.debug(f'sign: {sign}')
+                    pass
+
         # Select the nu corresponding to the maximum lambda and store the maximum lambda
         coef.nu_var = coef.nu_var[coef.lambda_var.argmax(axis=0), np.arange(indx.inactive.size), :]
         coef.lambda_var = coef.lambda_var.max(axis=0)
+
         # Store the active variable
         indx.active = indx.inactive[coef.lambda_var.argmax()]
+        logger.debug(f'First active variable: {indx.active}')
+
         # Store initial nu0 and nu
         coef.nu0 = coef.nu_var[indx.active, 0]
         coef.nu = coef.nu_var[indx.active, 1:]
