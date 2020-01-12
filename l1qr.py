@@ -408,6 +408,32 @@ class L1QR:
             plt.savefig(file_name,  bbox_inches='tight', pad_inches=0.02)
         plt.close('all')
 
+    def predict(self, x: pd.DataFrame, s: Optional[float] = None) -> pd.Series:
+        """Make a prediction.
+
+        Args:
+            x: A DataFrame with values to be predicted. The dimensions need to match
+               the data used for training the model.
+            s: The penalty parameter for which a prediction is returned.
+
+        Returns:
+            A Series with predictions for x.
+        """
+        if s < min(self.s) or s > max(self.s):
+            raise ValueError(f's = {s} should be between '
+                             f'{min(self.s):.2f} and {max(self.s):.2f}.')
+
+        if set(self.b.columns) != set(x.columns):
+            raise ValueError('The columns of b and x do not match!')
+
+        x = x[self.b.columns]
+        prediction = self.b0.to_numpy() + self.b.to_numpy().dot(x.to_numpy().T).T
+
+        s0 = np.linspace(self.s[0], self.s[-1], 1000)
+        p = pd.Series(np.apply_along_axis(lambda w: np.interp(s, s0, w), 1, prediction),
+                      index=x.index)
+        return p
+
 
 if __name__ == "__main__":
 
@@ -415,7 +441,21 @@ if __name__ == "__main__":
     Y = pd.read_csv("input/returns.txt", index_col=0).squeeze()
     X = pd.read_csv("input/quantile_predicitons.txt", index_col=0)
 
+    # Split data into an in-sample and an out-sample-part
+    share = 0.9
+    n = len(Y)
+    idx_in = range(int(np.floor(n * share)))
+    idx_out = range(int(np.floor(n * share)), n)
+
+    Y_in, X_in = Y.iloc[idx_in], X.iloc[idx_in]
+    Y_out, X_out = Y.iloc[idx_out], X.iloc[idx_out]
+
     # Estimate the lasso quantile regression
-    mdl = L1QR(y=Y, x=X, alpha=0.01)
+    mdl = L1QR(y=Y_in, x=X_in, alpha=0.01)
     mdl.fit(s_max=3)
+
+    # Plot the trace
     mdl.plot_trace(file_name="output/trace_plot.png", size=(10, 6))
+
+    # Make prediction
+    pred = mdl.predict(x=X_out, s=1)
